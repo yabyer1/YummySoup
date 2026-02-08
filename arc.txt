@@ -1,0 +1,14 @@
+.
+├── include/
+│   ├── Client.hpp          // Connection metadata & buffers
+│   ├── Protocol.hpp        // Command mapping & parsing
+│   ├── Storage.hpp         // The K/V store & PubSub registry
+│   ├── ThreadPool.hpp      // Worker management
+│   └── Network.hpp         // Socket utils (non-blocking, dual-stack)
+├── src/
+│   ├── Client.cpp
+│   ├── Protocol.cpp
+│   ├── Storage.cpp
+│   ├── ThreadPool.cpp
+│   └── main.cpp            // The epoll loop (The orchestrator)
+└── Makefile
