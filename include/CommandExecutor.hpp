@@ -8,60 +8,77 @@
 #include <memory>
 #include "Client.hpp"
 #include "Storage.hpp"
-
+#include "ServerContext.hpp"
 // Function signature for all commands
 using CommandFunc = std::function<void(std::shared_ptr<Client>, const std::vector<std::string_view>&, Storage&)>;
 
 class CommandExecutor {
 private:
     std::unordered_map<std::string_view, CommandFunc> commands;
+   
+
 
 public:
-    CommandExecutor() {
-        // Define SET
-        commands["SET"] = [](auto client, const auto& args, Storage& db) {
+  CommandExecutor() {
+        // --- SET Command ---
+        commands["SET"] = [this](auto client, const auto& args, Storage& db) {
             if (args.size() < 3) {
-                std::string err = "-ERR wrong number of arguments for 'set'\r\n";
-                write(client->fd, err.c_str(), err.length());
+                (void)write(client->fd, "-ERR wrong number of arguments for 'set'\r\n", 42);
                 return;
             }
             db.set(std::string(args[1]), std::string(args[2]));
-            write(client->fd, "+OK\r\n", 5);
+            
+            // Log to AOF for durability
+            ctx.aof.log(args); 
+            
+            (void)write(client->fd, "+OK\r\n", 5);
         };
 
-        // Define GET
+        // --- GET Command ---
         commands["GET"] = [](auto client, const auto& args, Storage& db) {
             if (args.size() < 2) {
-                std::string err = "-ERR wrong number of arguments for 'get'\r\n";
-                write(client->fd, err.c_str(), err.length());
+                (void)write(client->fd, "-ERR wrong number of arguments for 'get'\r\n", 42);
                 return;
             }
             std::string val = db.get(std::string(args[1]));
             if (val == "(nil)") {
-                write(client->fd, "$-1\r\n", 5); // Redis-style null
+                (void)write(client->fd, "$-1\r\n", 5);
             } else {
                 std::string resp = "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
-                write(client->fd, resp.c_str(), resp.length());
+                (void)write(client->fd, resp.c_str(), resp.length());
             }
         };
 
-        // Define PING
+        // --- DEL Command ---
+        commands["DEL"] = [this](auto client, const auto& args, Storage& db) {
+            if (args.size() < 2) {
+                (void)write(client->fd, "-ERR wrong number of arguments for 'del'\r\n", 42);
+                return;
+            }
+            db.del(std::string(args[1]));
+            ctx.aof.log(args);
+            (void)write(client->fd, "+OK\r\n", 5);
+        };
+        // --- PING Command ---
         commands["PING"] = [](auto client, const auto& args, Storage& db) {
-            write(client->fd, "+PONG\r\n", 7);
+            (void)write(client->fd, "+PONG\r\n", 7);
         };
     }
 
-    void execute(std::shared_ptr<Client> client, const std::vector<std::string_view>& args, Storage& db) {
-        if (args.empty()) return;
-        
-        auto it = commands.find(args[0]); // args[0] is the command name (e.g., "SET")
-        if (it != commands.end()) {
-            it->second(client, args, db);
-        } else {
-            std::string err = "-ERR unknown command '" + std::string(args[0]) + "'\r\n";
-            write(client->fd, err.c_str(), err.length());
-        }
-    }
+    void CommandExecutor::execute(std::shared_ptr<Client> client, 
+                             const std::vector<std::string_view>& tokens, 
+                             Storage& db) {
+  if(tokens.empty()) return;
+  //convert the command name to uppercase for case-insensitive matching
+  auto it = commands.find(tokens[0]);
+  if(it != commands.end()){
+    it ->second(client, tokens, db); //execute the command function
+  }
+  else{
+    std::string err = "-ERR unknown command '" + std::string(tokens[0]) + "'\r\n";
+    (void)write(client->fd, "-ERR unknown command\r\n", 22);
+  }
+}
 };
 
 #endif

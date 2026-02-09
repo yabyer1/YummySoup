@@ -20,5 +20,17 @@ public:
         auto it = kv_store.find(key);
         return (it != kv_store.end()) ? it->second : "(nil)";
     }
+    void del(const std::string& key) {
+        std::unique_lock lock(store_mutex);
+        kv_store.erase(key);
+    }
+    void serializeToAof(int fd) {
+        std::shared_lock lock(store_mutex); // Lock the store for reading during serialization
+        for (const auto& [key, value] : kv_store) {
+            std::vector<std::string_view> tokens = {"SET", key, value};
+            std::string serialized = ProtocolHandler::to_resp(tokens);
+            write(fd, serialized.c_str(), serialized.size());
+        }
+    }
 };
 #endif
