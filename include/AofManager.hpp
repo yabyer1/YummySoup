@@ -84,7 +84,7 @@ void trigger_aof_rewrite(Storage& current_db){
 
             //child
           int temp_fd = open("temp_base.aof", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-          current_db.serializeToAof(temp_fd);
+          current_db.serializeToAof(temp_fd); //have the child serialize to the temp file 
         close(temp_fd);
         _exit(0);
     }
@@ -106,7 +106,8 @@ pid_t rewrite_child_pid = -1;
 void check_rewrite_status(){
     if(rewrite_child_pid == -1)return; // No rewrite in progress
     int status ;
-    pid_t result = waitpid(rewrite_child_pid, &status, WNOHANG);
+    pid_t result = waitpid(rewrite_child_pid, &status, WNOHANG); //wait no hanf tells the kernel to check if the child is a zombie
+    //if the child is a zombie give me its info and clean up the child process, else return.
     if(result == rewrite_child_pid){
         if(WIFEXITED(status) && WEXITSTATUS(status) == 0){
             // Rewrite successful, replace old AOF with new one

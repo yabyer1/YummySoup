@@ -86,8 +86,8 @@ void workerThread() {
             client->appendToInput((char*)iov[client->ring_index].iov_base, n);
             io_uring_cqe_seen(&local_ring, cqe);
 
-            while(auto tokens = ProtocolHandler::parse(client -> data, client -> buffer_index)) {
-                executor.execute(client, *tokens, ctx.db);
+            while(auto tokens = ProtocolHandler::parse(client -> data, client -> buffer_index)) { // we are parsing input buffer line by line \n delimited. we then split into space delimited tokens on the line and execute that line
+                executor.execute(client, *tokens, ctx.db); 
             }
 
             // 4. Re-arm Epoll one shot for next event on this client
@@ -155,8 +155,20 @@ int main() {
     std::cout << "3FS-Style io_uring Server Online. Port 1234." << std::endl;
 
     while (true) {
-        int nfds = epoll_wait(global_epoll_fd, events, MAX_EVENTS, -1); // Wait for events on the epoll instance. This call will block until at least one event occurs on the monitored file descriptors (e.g., new connection on the listening socket or incoming data on client sockets). The events will be stored in the events array, and nfds will indicate how many events were triggered. By using epoll_wait, we can efficiently handle a large number of concurrent connections and events without blocking, improving the scalability and responsiveness of our server. we use max events as a limit to how many processed at a time. 
-        for (int i = 0; i < nfds; ++i) {
+        int nfds = epoll_wait(global_epoll_fd, events, MAX_EVENTS, 100); // Wait for events on the epoll instance. This call will block until at least one event occurs on the monitored file descriptors (e.g., new connection on the listening socket or incoming data on client sockets). The events will be stored in the events array, and nfds will indicate how many events were triggered. By using epoll_wait, we can efficiently handle a large number of concurrent connections and events without blocking, improving the scalability and responsiveness of our server. we use max events as a limit to how many processed at a time. 
+       //100 is last param  -> 10 cron beats per second
+       if(nfds == 0){
+        ctx.aof.flushToDisk();
+        ctx.aof.check_rewrite_status(); //rewrite in progress will be completed by the child process, we just need to check on the status and when its done we can replace the old aof with the new one. This allows us to perform AOF rewrites in the background without blocking the main server thread, ensuring that our persistence mechanism does not impact the responsiveness of the server. By periodically checking the rewrite status, we can seamlessly transition to the new AOF file once the rewrite is complete, maintaining data integrity and durability in our server architecture.
+
+        if(ctx.aof.rewrite_child_pid == -1 && ctx.aof.should_trigger_rewrite_aof()){ //trigger if rewrite is needed and one isnt runnign
+            ctx.aof.trigger_aof_rewrite(ctx.db);
+        }
+        continue;
+       }
+       
+       
+       for (int i = 0; i < nfds; ++i) {
             if (events[i].data.fd == listen_fd) { // if listen_fd == events[i].data.fd, it means we have a new incoming connection to accept. We will handle this in the main thread to quickly accept the connection and add it to the epoll instance for monitoring. By accepting connections in the main thread, we can ensure that we do not block worker threads with accept calls, allowing them to focus on processing client requests. Once a new connection is accepted, we will set it to non-blocking mode, assign it a buffer slot from the slab, and add it to the clients map and epoll instance for further monitoring.
                 while (true) { //we may have more than one incoming connection, so we loop to accept all pending connections until there are no more (accept returns -1 with EAGAIN or EWOULDBLOCK). This allows us to efficiently handle bursts of incoming connections without missing any. By using non-blocking sockets
                     int conn_fd = accept(listen_fd, NULL, NULL);

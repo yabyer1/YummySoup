@@ -6,5 +6,6 @@
 #include "ProtocolHandler.hpp"
 #include "CommandExecutor.hpp"
 #include "SlabSlotManager.hpp"
+#include "AofManager.hpp"
 #include "ServerContext.hpp"
 #endif

@@ -65,7 +65,7 @@ public:
         };
     }
 
-    void CommandExecutor::execute(std::shared_ptr<Client> client, 
+    void execute(std::shared_ptr<Client> client, 
                              const std::vector<std::string_view>& tokens, 
                              Storage& db) {
   if(tokens.empty()) return;

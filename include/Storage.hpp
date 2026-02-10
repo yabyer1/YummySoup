@@ -4,6 +4,7 @@
 #include <shared_mutex>
 #include <string>
 #include <mutex>
+#include "ProtocolHandler.hpp"
 class Storage {
 private:
     std::unordered_map<std::string, std::string> kv_store; //key value store for now
