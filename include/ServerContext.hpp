@@ -11,7 +11,7 @@ public: // <-- Add this line!
     Storage db;
     AofManager aof;
     // The constructor must also be public so 'ctx' can be created
-    ServerContext() : slabManager(1024), aof("appendonly.aof") {}
+    ServerContext() : slabManager(1024), aof("appendonly.aof.-1.base.aof") {}
 };
 
 extern ServerContext ctx; 

@@ -11,6 +11,20 @@
 #include "ProtocolHandler.hpp"
 #include "Storage.hpp"
 #define AOF_BUF_SIZE 65536 
+enum class AofFileType{BASE = 'b', INCR = 'i', HISTORY = 'h'}; //redis method
+struct AofFileInfo{
+    AofFileType type;
+    std::string filename;
+    long long seq;
+};
+struct AofManifest{
+    AofFileInfo base_file;
+    std::vector<AofFileInfo> incr_files;
+    std::vector<AofFileInfo> history_files;
+    long long curr_base_seq = 0;
+    long long curr_incr_seq = 0;
+};
+
 class AofManager {
     private:
     int aof_fd;
@@ -21,7 +35,9 @@ class AofManager {
     file_buffer * aobuffer; //pointer to the filebuffer
     file_buffer * flushbuffer;
     std::mutex aofMutex;
-    std::string filename;
+    std::string filename = "appendonly.aof.-1.base.aof"; //initial filename, will be renamed on first rewrite
+    AofManifest manifest;
+    
     public:
     AofManager(const std::string& path) : filename(path) {
             aof_fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644); //oappend ensures the kernel handels the write offset for us and we dont have to worry about multiple threads writing at the same time. the kernel will serialize the writes for us. this is much more efficient than locking around the file and managing offsets ourselves in user space.
@@ -74,7 +90,23 @@ class AofManager {
     tempbuffer->buf_ptr = 0; // Reset the buffer pointer after flushing to disk. This allows us to reuse the same buffer for future commands without needing to allocate a new one, improving memory efficiency and reducing overhead in our AOF management. By resetting the buffer pointer, we can ensure that subsequent log calls will write to the correct position in the buffer, maintaining the integrity of our AOF persistence mechanism.
 
 }
+void openNewIncrFile(){
+    if(aof_fd >= 0){
+        close(aof_fd); // Close the current AOF file descriptor before opening a new one. This ensures that we do not have multiple file descriptors open for different AOF files, which could lead to confusion and potential data corruption. By closing the current file descriptor, we can safely transition to the new incremental AOF file for logging future commands, maintaining the integrity of our persistence mechanism.
+    }
+    std::string incr_filename = "appendonly.aof." + std::to_string(++manifest.curr_incr_seq) + ".incr.aof";
+    aof_fd = open(incr_filename.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if(aof_fd == -1){
+        perror("Failed to open new incremental AOF file");
+        return;
+    }
+    manifest.incr_files.push_back({AofFileType::INCR, incr_filename, manifest.curr_incr_seq});
+}
+pid_t rewrite_child_pid = -1;
 void trigger_aof_rewrite(Storage& current_db){
+    manifest.curr_incr_seq++;//we will create a new incr file for rewrite
+    openNewIncrFile();
+    
     pid_t pid = fork();
     if(pid < 0){
         perror("Failed to fork for AOF rewrite");
@@ -83,26 +115,64 @@ void trigger_aof_rewrite(Storage& current_db){
     if(pid == 0){
 
             //child
-          int temp_fd = open("temp_base.aof", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            std::string temp_base = "temp-base." + std::to_string(getpid()) + ".aof";
+          int temp_fd = open(temp_base.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
           current_db.serializeToAof(temp_fd); //have the child serialize to the temp file 
         close(temp_fd);
         _exit(0);
     }
     else{
+        rewrite_child_pid = pid; //parent sets the child pid so it can check on its status later and replace the old aof with the new one when its done. This allows us to perform AOF rewrites in the background without blocking the main server thread, ensuring that our persistence mechanism does not impact the responsiveness of the server. By periodically checking the rewrite status, we can seamlessly transition to the new AOF file once the rewrite is complete, maintaining data integrity and durability in our server architecture.
         std::cout<<"Background rewrite with pid: "<<pid<<std::endl;
     }
 }
 
 bool should_trigger_rewrite_aof() {
     struct stat st;
-    if (stat("appendonly.aof", &st) == 0) {
+    if (stat(filename.c_str(), &st) == 0) {
         // Trigger if file exceeds 100MB
         // 100 * 1024 * 1024 = 104857600 bytes
         return st.st_size > 104857600; 
     }
     return false;
 }
-pid_t rewrite_child_pid = -1;
+void PersistManifest(){
+    std::string manifest_path = "aoppendonly.aof.manifest";
+    std::string tmp_manifest =  manifest_path + ".tmp";
+    FILE* fp = fopen(tmp_manifest.c_str(), "w");
+    if(!fp){
+        perror("Failed to open manifest file for writing");
+        return;
+    }
+    if(!manifest.base_file.filename.empty()){
+        fprintf(fp, "file %s seq %lld type b\n", 
+                manifest.base_file.filename.c_str(), manifest.base_file.seq);
+    }
+    for(const auto& f : manifest.incr_files){
+        fprintf(fp, "file %s seq %lld type i\n", 
+                f.filename.c_str(), f.seq);
+    }
+    for(const auto& f : manifest.history_files){
+        fprintf(fp, "file %s seq %lld type h\n",
+                f.filename.c_str(), f.seq);
+        }
+        fflush(fp);
+        fsync(fileno(fp)); // Ensure manifest is flushed to disk for durability. 
+        fclose(fp);
+        rename(tmp_manifest.c_str(), manifest_path.c_str()); // Atomically replace old manifest with new one. This ensures that we do not end up with a partially written manifest file in case of a crash during the write operation, maintaining the integrity of our AOF persistence mechanism. By writing to a temporary file and then renaming it, we can guarantee that the manifest is always in a consistent state on disk, allowing for reliable recovery and replication in our server architecture.
+}
+void CleanupHistory(){
+    // Remove old history files that are no longer needed after a successful rewrite. This helps to free up disk space and maintain a clean state for our AOF persistence mechanism. By cleaning up old history files, we can ensure that we do not accumulate unnecessary files over time, improving the efficiency of our storage management and keeping our server environment organized.
+    for(const auto& f : manifest.history_files){
+        if(unlink(f.filename.c_str()) != 0){
+            perror(("Failed to remove history file: " + f.filename).c_str());
+        }
+        else{
+            std::cout<<"Removed history file: "<<f.filename<<std::endl;
+        }
+    }
+    manifest.history_files.clear(); // Clear the history files list in the manifest after cleanup
+}
 void check_rewrite_status(){
     if(rewrite_child_pid == -1)return; // No rewrite in progress
     int status ;
@@ -111,11 +181,22 @@ void check_rewrite_status(){
     if(result == rewrite_child_pid){
         if(WIFEXITED(status) && WEXITSTATUS(status) == 0){
             // Rewrite successful, replace old AOF with new one
-            if(rename("temp_base.aof", "appendonly.aof") != 0){
+            std::string new_base = "appendonly.aof." + std::to_string(++manifest.curr_base_seq) + ".base.aof";
+             std::string temp_base = "temp-base." + std::to_string(result) + ".aof";
+            if(rename(temp_base.c_str(), new_base.c_str()) != 0){
                 perror("Failed to replace old AOF with new AOF");
+               
             }
             else{
+                filename = new_base; //update current filename to new base
+                 for(auto & f : manifest.incr_files){
+                   manifest.history_files.push_back(f); //move old incr files to history since they are now part of the base
+                }
+                manifest.base_file = {AofFileType::BASE ,new_base, manifest.curr_base_seq };
+
                 std::cout<<"AOF rewrite completed successfully."<<std::endl;
+                PersistManifest();
+                CleanupHistory();
             }
         }
         else{
