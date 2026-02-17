@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include "common.hpp"
 #include "ProtocolHandler.hpp"
 #include "Storage.hpp"
 #define AOF_BUF_SIZE 65536 
@@ -58,12 +59,12 @@ class AofManager {
         std::lock_guard<std::mutex> lock(aofMutex); // lock mutex so only one thread writes to this aof file
       if(serialized.size() > AOF_BUF_SIZE) {
             // If the command is larger than the buffer, write it directly
-            write(aof_fd, serialized.c_str(), serialized.size());
+            checked_write(aof_fd, serialized.c_str(), serialized.size());
             return;
         }
         if (aobuffer->buf_ptr + serialized.size() > AOF_BUF_SIZE) {
             // If the new command doesn't fit, flush the buffer first
-          write(aof_fd, aobuffer->data, aobuffer->buf_ptr); // Write the contents of the primary buffer to disk. This system call will block until the data is written to the AOF file, ensuring that our persistence mechanism is reliable and that commands are not lost in case of a crash. By writing the buffer to disk, we can maintain a durable log of all commands executed by the server, allowing for recovery and replication in our architecture. After the write operation completes, we can safely reset the primary buffer and allow it to continue accepting new commands without interruption.
+          checked_write(aof_fd, aobuffer->data, aobuffer->buf_ptr); // Write the contents of the primary buffer to disk. This system call will block until the data is written to the AOF file, ensuring that our persistence mechanism is reliable and that commands are not lost in case of a crash. By writing the buffer to disk, we can maintain a durable log of all commands executed by the server, allowing for recovery and replication in our architecture. After the write operation completes, we can safely reset the primary buffer and allow it to continue accepting new commands without interruption.
             aobuffer->buf_ptr = 0; // Reset the primary buffer after flushing to disk. This allows us to reuse the same buffer for future commands without needing to allocate a new one, improving memory efficiency and reducing overhead in our AOF management. By resetting the buffer, we can ensure that subsequent log calls will write to the correct position in the buffer, maintaining the integrity of our AOF persistence mechanism.
         }
         // Copy the serialized command into the buffer
@@ -205,6 +206,7 @@ void check_rewrite_status(){
         rewrite_child_pid = -1; // Reset the rewrite child PID
     }
 }
+
 };
 
 

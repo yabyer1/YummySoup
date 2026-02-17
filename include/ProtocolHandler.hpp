@@ -1,6 +1,6 @@
 #ifndef PROTOCOL_HANDLER_HPP
 #define PROTOCOL_HANDLER_HPP
-
+#include "common.hpp"
 #include <vector>
 #include <string_view>
 #include <optional>
@@ -10,6 +10,7 @@ class ProtocolHandler {
 public:
     // We pass the raw buffer and a reference to the current index (how much data is in it)
     static std::optional<std::vector<std::string_view>> parse(char* buffer, int& buffer_index) {
+        serverAssert(buffer_index <= 4096);
         // Wrap raw memory in a view for easy searching without copying
         std::string_view data_view(buffer, buffer_index);
         
@@ -33,6 +34,7 @@ public:
 
         // CRITICAL: "Consume" the data by shifting the remaining bytes left after this line 
         size_t bytes_consumed = pos + 1;
+        serverAssert(bytes_consumed <= (size_t)buffer_index);
         size_t remaining = buffer_index - bytes_consumed;
         
         if (remaining > 0) {
@@ -52,6 +54,55 @@ public:
          }
         return resp;
     }
+    static std::string format_pubsub(std::string_view type, std::string_view channel, std::string_view message) {
+    // Pub/Sub messages are RESP Arrays of 3 elements: ["message", channel, data]
+    std::vector<std::string_view> tokens = { type, channel, message };
+    return to_resp(tokens);
+}
 };
+
+#endif
+#ifdef TESTING_MODE
+void test_protocol_handler() {
+    std::cout << "Running ProtocolHandler Tests..." << std::endl;
+    
+    char buffer[] = "*2\r\n$3\r\nGET\r\n$4\r\nname\r\n";
+    int len = strlen(buffer);
+    auto tokens = ProtocolHandler::parse(buffer, len);
+    
+    serverAssert(tokens.has_value());
+    serverAssert(tokens->size() == 2);
+    serverAssert((*tokens)[0] == "GET");
+    
+    std::cout << "ProtocolHandler Tests Passed!" << std::endl;
+}
+
+void test_buffer_sliding() {
+    std::cout << "Testing Buffer Sliding (memmove)..." << std::endl;
+
+    char buffer[4096];
+    // Simulate two commands in one buffer
+    strcpy(buffer, "SET a 1\nGET a\n");
+    int buffer_index = strlen(buffer);
+
+    // Parse first command
+    auto tokens1 = ProtocolHandler::parse(buffer, buffer_index);
+    serverAssert(tokens1->size() == 3);
+    serverAssert((*tokens1)[0] == "SET");
+    
+    // Check that buffer_index was reduced and "GET a\n" moved to front
+    serverAssert(buffer_index == 6); 
+    serverAssert(strncmp(buffer, "GET a\n", 6) == 0);
+
+    // Parse second command
+    auto tokens2 = ProtocolHandler::parse(buffer, buffer_index);
+    serverAssert(tokens2->size() == 2);
+    serverAssert((*tokens2)[0] == "GET");
+    
+    // Final check: buffer should be empty
+    serverAssert(buffer_index == 0);
+
+    std::cout << "\033[1;32m✓ Buffer Sliding Tests Passed!\033[0m" << std::endl;
+}
 
 #endif

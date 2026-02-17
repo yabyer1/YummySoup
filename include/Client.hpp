@@ -5,7 +5,7 @@
 #include <mutex>
 #include <unistd.h> 
 #include <cstring>
-
+#include <unordered_set>
 enum class ClientState { NORMAL, SUBSCRIBED, REPLICA };
 
 class Client {
@@ -19,7 +19,8 @@ public:
     
     ClientState state = ClientState::NORMAL;
     std::mutex clientMutex;
-
+    std::unordered_set<std::string> subscribed_channels; // For Pub/Sub, track which channels this client is subscribed to
+    std::unordered_set<std::string> subscribed_patterns; // For Pub/Sub, track which patterns this client is subscribed to
     Client(int client_fd) : fd(client_fd) {}
     ~Client() { if (fd >= 0) close(fd); }
 

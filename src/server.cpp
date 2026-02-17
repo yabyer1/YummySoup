@@ -37,6 +37,35 @@ void set_nonblocking(int fd) { // Set a file descriptor to non-blocking mode
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+void cleanupClientPubSub(Client* c, ServerContext& ctx) {
+    std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
+
+    // 1. Remove from exact channels using the client's local set
+    for (const auto& channel : c->subscribed_channels) {
+        auto it = ctx.pubsub_channels.find(channel);
+        if (it != ctx.pubsub_channels.end()) {
+            it->second.remove(c); 
+            if (it->second.empty()) {
+                ctx.pubsub_channels.erase(it);
+            }
+        }
+    }
+    c->subscribed_channels.clear();
+
+    // 2. Remove from global patterns
+    auto it = ctx.pubsub_patterns.begin();
+    while (it != ctx.pubsub_patterns.end()) {
+        if (it->client == c) {
+            it = ctx.pubsub_patterns.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+void handleDisconnect(Client* c) {
+    // 1. Remove from Pub/Sub (O(N) patterns, O(1) channels)
+    cleanupClientPubSub(c, ctx);
+}
 
 // --- Worker Logic ---
 void workerThread() {
@@ -79,6 +108,7 @@ void workerThread() {
         
         if (ret < 0 || cqe->res <= 0) {
             close_connection = (ret < 0 || cqe->res == 0);
+            handleDisconnect(client.get());
             if (cqe) io_uring_cqe_seen(&local_ring, cqe);
         } else {
             int n = cqe->res; 
@@ -87,7 +117,7 @@ void workerThread() {
             io_uring_cqe_seen(&local_ring, cqe);
 
             while(auto tokens = ProtocolHandler::parse(client -> data, client -> buffer_index)) { // we are parsing input buffer line by line \n delimited. we then split into space delimited tokens on the line and execute that line
-                executor.execute(client, *tokens, ctx.db); 
+                executor.execute(client, *tokens, ctx); 
             }
 
             // 4. Re-arm Epoll one shot for next event on this client
