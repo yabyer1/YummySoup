@@ -25,6 +25,7 @@ public:
              Storage& db = ctx.db; // Access the storage from the server context
             if (args.size() < 3) {
                 (void)checked_write(client, "-ERR wrong number of arguments for 'set'\r\n", 42);
+                     ctx.ready_clients.push(client);
                 return;
             }
             db.set(std::string(args[1]), std::string(args[2]));
@@ -33,6 +34,7 @@ public:
             ctx.aof.log(args); 
             
             (void)checked_write(client, "+OK\r\n", 5);
+                 ctx.ready_clients.push(client);
         };
 
         // --- GET Command ---
@@ -40,6 +42,7 @@ public:
             Storage& db = ctx.db; // Access the storage from the server context
             if (args.size() < 2) {
                 (void)checked_write(client, "-ERR wrong number of arguments for 'get'\r\n", 42);
+                     ctx.ready_clients.push(client);
                 return;
             }
             std::string val = db.get(std::string(args[1]));
@@ -49,6 +52,7 @@ public:
                 std::string resp = "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
                 (void)checked_write(client, resp.c_str(), resp.length());
             }
+            ctx.ready_clients.push(client);
         };
 
         // --- DEL Command ---
@@ -57,66 +61,69 @@ public:
           
             if (args.size() < 2) {
                 (void)checked_write(client, "-ERR wrong number of arguments for 'del'\r\n", 42);
+                     ctx.ready_clients.push(client);
                 return;
             }
             db.del(std::string(args[1]));
             ctx.aof.log(args);
             (void)checked_write(client, "+OK\r\n", 5);
+                 ctx.ready_clients.push(client);
         };
         // --- PING Command ---
         commands["PING"] = [](auto client, const auto& args, ServerContext& ctx) {
           
             (void)checked_write(client, "+PONG\r\n", 7);
+                 ctx.ready_clients.push(client);
         };
 
         commands["PUBLISH"] = [this](auto client, const auto& args, ServerContext& ctx) {
             publish(args, ctx);
         };
         commands["SUBSCRIBE"] = [this](auto client, const auto& args, ServerContext& ctx) {
-            subscribe(client.get(), args, ctx);
+            subscribe(client, args, ctx);
         };
         commands["UNSUBSCRIBE"] = [this](auto client, const auto& args, ServerContext& ctx) {
-            unsubscribe(client.get(), args, ctx);
+            unsubscribe(client, args, ctx);
         };
         commands["PSUBSCRIBE"] = [this](auto client, const auto& args, ServerContext& ctx) {
-            psubscribe(client.get(), args, ctx);
+            psubscribe(client, args, ctx);
         };
         commands["PUNSUBSCRIBE"] = [this](auto client, const auto& args, ServerContext& ctx) {
-            punsubscribe(client.get(), args, ctx);
+            punsubscribe(client, args, ctx);
         };
     }
-    void punsubscribe(Client* c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
+    void punsubscribe(std::shared_ptr<Client> client, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
     for (size_t i = 1; i < tokens.size(); ++i) {
         std::string pattern(tokens[i]);
-        c->subscribed_patterns.erase(pattern); // Remove from client's local set
+        client->subscribed_patterns.erase(pattern); // Remove from client's local set
         auto it = ctx.pubsub_patterns.begin();
         while (it != ctx.pubsub_patterns.end()) {
-            if (it->client == c && it->pattern == pattern) {
+            if (it->client == client && it->pattern == pattern) {
                 it = ctx.pubsub_patterns.erase(it);
             } else {
                 ++it;
             }
         }
         // Respond with unsubscription confirmation (Redis protocol)
-        sendSubscriptionConfirmation(c, "punsubscribe", pattern, c->subscribed_patterns.size());
+        sendSubscriptionConfirmation(client, "punsubscribe", pattern, client->subscribed_patterns.size());
     }
 }
 
-   void psubscribe(Client* c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
+   void psubscribe(std::shared_ptr<Client> client, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
     for (size_t i = 1; i < tokens.size(); ++i) {
         std::string pattern(tokens[i]);
         
         // Only add if not already subscribed
-        if (c->subscribed_patterns.insert(pattern).second) {
-            ctx.pubsub_patterns.push_back({c, pattern});
+        if (client->subscribed_patterns.insert(pattern).second) {
+            ctx.pubsub_patterns.push_back({client, pattern});
         }
         // Respond with subscription confirmation (Redis protocol)
-        sendSubscriptionConfirmation(c, "psubscribe", pattern, c->subscribed_patterns.size());
+        sendSubscriptionConfirmation(client, "psubscribe", pattern, client->subscribed_patterns.size());
     }
    }
-    void unsubscribe(Client* c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
+    void unsubscribe(std::shared_ptr<Client> c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
     for (size_t i = 1; i < tokens.size(); ++i) {
         std::string channel(tokens[i]);
@@ -132,27 +139,31 @@ public:
         sendSubscriptionConfirmation(c, "unsubscribe", channel, c->subscribed_channels.size());
     }
 }
-    void sendPubsubMessage(Client* c, std::string_view channel, std::string_view message) {
+    void sendPubsubMessage(std::shared_ptr<Client> c, std::string_view channel, std::string_view message) {
     std::string resp = ProtocolHandler::format_pubsub("message", channel, message);
     (void)checked_write(c, resp.c_str(),  resp.size());
+     ctx.ready_clients.push(c);
+   
     }
-    void sendPatternMessage(Client* c, std::string_view pattern, std::string_view channel, std::string_view message) {
+    void sendPatternMessage(std::shared_ptr<Client> c, std::string_view pattern, std::string_view channel, std::string_view message) {
     std::string resp = ProtocolHandler::format_pubsub("pmessage", channel, message);
     (void)checked_write(c, resp.c_str(), resp.size());
+     ctx.ready_clients.push(c);
+   
     }
         void publish(const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     serverAssert(tokens.size() >= 3); // PUBLISH <channel> <message>
     
     std::string_view channel = tokens[1];
     std::string_view message = tokens[2];
-    std::unordered_set<Client*> visited;
+    std::unordered_set<std::shared_ptr<Client>> visited;
 
     std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
 
     // 1. Exact Match Broadcast
     auto it = ctx.pubsub_channels.find(std::string(channel));
     if (it != ctx.pubsub_channels.end()) {
-        for (Client* c : it->second) {
+        for (std::shared_ptr<Client> c : it->second) {
             serverAssert(c != nullptr);
             sendPubsubMessage(c, channel, message);
             visited.insert(c);
@@ -169,13 +180,14 @@ public:
         }
     }
 }
-void sendSubscriptionConfirmation(Client* c, std::string_view type, std::string_view channel, size_t subscription_count) {
+void sendSubscriptionConfirmation(std::shared_ptr<Client> c, std::string_view type, std::string_view channel, size_t subscription_count) {
    std::string count_str = std::to_string(subscription_count);
     std::vector<std::string_view> tokens = { type, channel, count_str };
     std::string resp = ProtocolHandler::to_resp(tokens);
     (void)checked_write(c,  resp.c_str(), resp.size());
+     ctx.ready_clients.push(c);
 }
-void subscribe(Client* c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
+void subscribe(std::shared_ptr<Client> c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
     for (size_t i = 1; i < tokens.size(); ++i) {
         std::string channel(tokens[i]);
@@ -188,7 +200,7 @@ void subscribe(Client* c, const std::vector<std::string_view>& tokens, ServerCon
         sendSubscriptionConfirmation(c, "subscribe", channel, c->subscribed_channels.size());
     }
 }
-    void execute(std::shared_ptr<Client> client, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
+    void execute(std::shared_ptr<Client> c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     if (tokens.empty()) return;
 
     // Convert command name to uppercase
@@ -197,10 +209,11 @@ void subscribe(Client* c, const std::vector<std::string_view>& tokens, ServerCon
 
     auto it = commands.find(cmd_name);
     if (it != commands.end()) {
-        it->second(client, tokens, ctx);
+        it->second(c, tokens, ctx);
     } else {
         std::string err = "-ERR unknown command '" + cmd_name + "'\r\n";
-        (void)checked_write(client, err.c_str(), err.size());
+        (void)checked_write(c, err.c_str(), err.size());
+         ctx.ready_clients.push(c);
     }
 }
 };

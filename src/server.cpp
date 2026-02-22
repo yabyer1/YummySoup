@@ -23,7 +23,8 @@
 ServerContext ctx; // Global server context containing shared resources like the slab manager and storage
 struct io_uring ring;  // Global io_uring instance for all workers
 void* shared_buffer_slab;  // Pre-allocated slab for zero-copy reads
-struct iovec iov[1024]; // iovec array for registered buffers
+struct iovec iov[1024]; // iovec array for registered buffers (reading)
+struct iovec iovw[1024]; // iovec array for registered buffers (writing)
 int global_epoll_fd;// Global epoll instance for accepting connections and monitoring clients
 std::unordered_map<int, std::shared_ptr<Client>> clients; // Map of client file descriptors to Client objects
 std::mutex clientsMapMutex; // Mutex to protect access to the clients map
@@ -38,7 +39,7 @@ void set_nonblocking(int fd) { // Set a file descriptor to non-blocking mode
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
-void cleanupClientPubSub(Client* c, ServerContext& ctx) {
+void cleanupClientPubSub(std::shared_ptr<Client> c, ServerContext& ctx) {
     std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
 
     // 1. Remove from exact channels using the client's local set
@@ -63,11 +64,61 @@ void cleanupClientPubSub(Client* c, ServerContext& ctx) {
         }
     }
 }
-void handleDisconnect(Client* c) {
+void handleDisconnect(std::shared_ptr<Client> c) {
     // 1. Remove from Pub/Sub (O(N) patterns, O(1) channels)
     cleanupClientPubSub(c, ctx);
 }
+void flush_worker_thread(ServerContext& ctx) {
+    while (true) {
+        // 1. Block until a client has data ready
+        std::shared_ptr<Client> client = ctx.ready_clients.pop();
 
+        if (!client) continue;
+
+        // 2. Lock the client to safely access its response_buffer
+        std::lock_guard<std::mutex> lock(client->clientMutex);
+        
+        if (client->response_buffer.empty()) {
+            continue; 
+        }
+
+        // 3. Consolidate vector of strings into the Registered Write Slab
+        // We use the client's specific write_slab_ptr assigned from writeSlabManager
+        size_t total_bytes = 0;
+        char* target_buf = client->write_slab_ptr; 
+
+        for (const auto& msg : client->response_buffer) {
+            if (total_bytes + msg.size() > BUF_SIZE) {
+                // In a real scenario, you'd handle overflow here
+                break; 
+            }
+            memcpy(target_buf + total_bytes, msg.data(), msg.size());
+            total_bytes += msg.size();
+        }
+
+        // 4. Prepare the io_uring SQE for the WRITE_RING
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx.write_ring);
+        if (!sqe) {
+            // Sqe might be null if the ring is full; in production, you'd handle backpressure
+            continue;
+        }
+
+        // Use WRITE_FIXED for maximum performance with registered buffers
+        io_uring_prep_write_fixed(sqe, client->fd, target_buf, total_bytes, 0, client->write_buf_index);
+        
+        // Attach the client pointer so we can clear the buffer in the completion loop
+        io_uring_sqe_set_data(sqe, client.get());
+
+        // 5. Submit to the kernel
+        // Note: Using io_uring_submit is thread-safe if you don't use 
+        // IORING_SETUP_SINGLE_ISSUER, or if only flush threads touch this ring.
+        io_uring_submit(&ctx.write_ring);
+
+        // 6. Clear the pending buffer now that it's queued for the kernel
+        client->response_buffer.clear();
+        client->has_pending_write.store(false, std::memory_order_release);
+    }
+}
 // --- Worker Logic ---
 void workerThread() {
     CommandExecutor executor;
@@ -109,7 +160,7 @@ void workerThread() {
         
         if (ret < 0 || cqe->res <= 0) {
             close_connection = (ret < 0 || cqe->res == 0);
-            handleDisconnect(client.get());
+            handleDisconnect(client);
             if (cqe) io_uring_cqe_seen(&local_ring, cqe);
         } else {
    
@@ -131,7 +182,7 @@ void workerThread() {
 
         if (close_connection) {
             std::cout << "Closing connection for fd: " << client->fd << std::endl;
-            ctx.slabManager.release_slot(client->ring_index); // Release the client's buffer slot back to the slab maanger
+            ctx.readSlabManager.release_slot(client->ring_index); // Release the client's buffer slot back to the slab maanger
             std::lock_guard<std::mutex> mapLock(clientsMapMutex);
             clients.erase(client->fd);
         }
@@ -192,7 +243,10 @@ int main() {
             
         }).detach();
     }
-
+    // Spawn Flush Threads (Outbound IO)
+    for (int i = 0; i < 2; ++i) {
+        std::thread(flush_worker_thread, std::ref(ctx)).detach();
+    }
     std::cout << "3FS-Style io_uring Server Online. Port 1234." << std::endl;
 
     while (true) {
@@ -221,7 +275,7 @@ int main() {
 
                     auto new_client = std::make_shared<Client>(conn_fd); //make client a shared pointer to manage its lifetime across threads. This allows us to safely share the client object between the main thread (which accepts connections) and worker threads (which process client requests) without worrying about manual memory management or dangling pointers. By using std::shared_ptr, we can ensure that the client object is automatically deleted when it is no longer needed, preventing memory leaks and ensuring safe access across threads.
                     // Assign a unique buffer slot from the slab
-                    int assigned_slot = ctx.slabManager.pick_slot(); // Pick a free slot from the slab slot manager for this new client. This allows us to efficiently manage the allocation of buffer slots for clients, ensuring that we can reuse slots when clients disconnect and freeing up resources for new connections. By using a slab allocator, we can minimize fragmentation and improve performance when handling a large number of concurrent clients, as each client can be assigned a fixed-size buffer slot from the pre-allocated slab.
+                    int assigned_slot = ctx.readSlabManager.pick_slot(); // Pick a free slot from the slab slot manager for this new client. This allows us to efficiently manage the allocation of buffer slots for clients, ensuring that we can reuse slots when clients disconnect and freeing up resources for new connections. By using a slab allocator, we can minimize fragmentation and improve performance when handling a large number of concurrent clients, as each client can be assigned a fixed-size buffer slot from the pre-allocated slab.
                     
                     if (assigned_slot == -1) {
                             // Log the error and drop the connection or close the socket
@@ -238,7 +292,25 @@ int main() {
 
                     new_client->ring_index = assigned_slot;  //find its index in the slab based on its file descriptor. This simple modulo operation allows us to assign each client a unique buffer slot in the pre-allocated slab without needing complex tracking of free slots. By using the file descriptor as the basis for the index, we can ensure that each client gets a consistent buffer slot across its lifetime, allowing for efficient zero-copy reads directly into the slab.
 
-                    {
+                 
+                     // Assign a unique buffer slot from the slab
+                    int assigned_slot_w = ctx.writeSlabManager.pick_slot(); // Pick a free slot from the slab slot manager for this new client. This allows us to efficiently manage the allocation of buffer slots for clients, ensuring that we can reuse slots when clients disconnect and freeing up resources for new connections. By using a slab allocator, we can minimize fragmentation and improve performance when handling a large number of concurrent clients, as each client can be assigned a fixed-size buffer slot from the pre-allocated slab.
+                    
+                    if (assigned_slot_w == -1) {
+                            // Log the error and drop the connection or close the socket
+                            fprintf(stderr, "Error: No free buffer slots available for new client\n");
+                            close(new_client->fd); 
+                            continue;
+                        }
+                    new_client -> write_slab_ptr = (char*)iovw[assigned_slot_w].iov_base;
+                    if(assigned_slot_w == -1) {
+                        std::cerr << "No free buffer slots available for new client!" << std::endl;
+                        close(conn_fd);
+                        continue;
+                    }
+
+
+                      {
                         std::lock_guard<std::mutex> lock(clientsMapMutex);
                         clients[conn_fd] = new_client; //set on map
                     }

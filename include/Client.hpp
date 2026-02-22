@@ -15,8 +15,9 @@ public:
     int fd;
     int buffer_index = 0; 
     int ring_index = -1;    
-    int buf_idx = 0;       
-    
+    int buf_idx = 0; 
+    char *  write_slab_ptr    = nullptr;  
+    int write_buf_index = 0;
     char * slab_ptr = nullptr;
     std::mutex clientMutex;
     std::unordered_set<std::string> subscribed_channels; // For Pub/Sub, track which channels this client is subscribed to
