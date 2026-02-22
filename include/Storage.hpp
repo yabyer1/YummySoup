@@ -30,7 +30,7 @@ public:
         for (const auto& [key, value] : kv_store) {
             std::vector<std::string_view> tokens = {"SET", key, value};
             std::string serialized = ProtocolHandler::to_resp(tokens);
-            checked_write(fd, serialized.c_str(), serialized.size());
+            checked_write_fd(fd, serialized.c_str(), serialized.size());
         }
     }
 };

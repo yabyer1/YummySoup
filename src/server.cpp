@@ -2,6 +2,7 @@
 #include <string>
 #include <unordered_map>
 #include <queue>
+#include <cstring>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -95,8 +96,8 @@ void workerThread() {
            
             if (sqe) {
                 // DMA directly into the client's assigned slot in the slab and submit it to local ring for reading 
-               io_uring_prep_read_fixed(sqe, client->fd, iov[client->ring_index].iov_base, BUF_SIZE, 0, client->ring_index);
-                io_uring_submit(&local_ring);
+               io_uring_prep_read_fixed(sqe, client->fd, client ->slab_ptr + client -> buffer_index, BUF_SIZE - client -> buffer_index, 0, client->ring_index);
+                io_uring_submit_and_wait(&local_ring, 1);
             }
         }
 
@@ -111,14 +112,15 @@ void workerThread() {
             handleDisconnect(client.get());
             if (cqe) io_uring_cqe_seen(&local_ring, cqe);
         } else {
-            int n = cqe->res; 
+   
             // 3. Zero-Copy Processing: Append from Slab to InputBuffer
-            client->appendToInput((char*)iov[client->ring_index].iov_base, n);
-            io_uring_cqe_seen(&local_ring, cqe);
-
-            while(auto tokens = ProtocolHandler::parse(client -> data, client -> buffer_index)) { // we are parsing input buffer line by line \n delimited. we then split into space delimited tokens on the line and execute that line
+           client-> buffer_index += cqe ->res;
+             while(auto tokens = ProtocolHandler::parse(client -> slab_ptr, client -> buffer_index)) { // we are parsing input buffer line by line \n delimited. we then split into space delimited tokens on the line and execute that line
                 executor.execute(client, *tokens, ctx); 
             }
+            io_uring_cqe_seen(&local_ring, cqe);
+
+          
 
             // 4. Re-arm Epoll one shot for next event on this client
             struct epoll_event ev;
@@ -179,7 +181,16 @@ int main() {
     epoll_ctl(global_epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev); // Add the listening socket to the epoll instance so that we can monitor it for incoming connection events. This allows us to efficiently wait for new connections without blocking, enabling our event-driven architecture. By using epoll, we can scale to a large number of concurrent connections while maintaining high performance. The listening socket will trigger an event when a new client attempts to connect, allowing us to accept the connection and add the new client socket to the epoll instance for further monitoring.
 
     for (int i = 0; i < THREAD_POOL_SIZE; ++i) {
-        std::thread(workerThread).detach(); //detatch all worker threads to run independently and handle client requests concurrently. This allows the server to efficiently process multiple client connections at the same time without blocking the main thread. By using a thread pool, we can limit the number of threads created while still providing sufficient concurrency to handle incoming requests, improving the scalability and responsiveness of our server. Each worker thread will wait for tasks to be added to the task queue and process them as they come in, allowing for efficient handling of client requests.
+        std::thread([&](){
+            struct io_uring local_ring;
+            struct io_uring_params local_params;
+            memset(&local_params, 0, sizeof(local_params));
+            local_params.wq_fd = ring.ring_fd; //use parent ring kernel threads (avoid creating speerate peR thread)
+            local_params.flags = IORING_SETUP_ATTACH_WQ;
+            io_uring_queue_init_params(ENTRIES, &local_ring, &local_params);
+   
+            
+        }).detach();
     }
 
     std::cout << "3FS-Style io_uring Server Online. Port 1234." << std::endl;
@@ -211,6 +222,14 @@ int main() {
                     auto new_client = std::make_shared<Client>(conn_fd); //make client a shared pointer to manage its lifetime across threads. This allows us to safely share the client object between the main thread (which accepts connections) and worker threads (which process client requests) without worrying about manual memory management or dangling pointers. By using std::shared_ptr, we can ensure that the client object is automatically deleted when it is no longer needed, preventing memory leaks and ensuring safe access across threads.
                     // Assign a unique buffer slot from the slab
                     int assigned_slot = ctx.slabManager.pick_slot(); // Pick a free slot from the slab slot manager for this new client. This allows us to efficiently manage the allocation of buffer slots for clients, ensuring that we can reuse slots when clients disconnect and freeing up resources for new connections. By using a slab allocator, we can minimize fragmentation and improve performance when handling a large number of concurrent clients, as each client can be assigned a fixed-size buffer slot from the pre-allocated slab.
+                    
+                    if (assigned_slot == -1) {
+                            // Log the error and drop the connection or close the socket
+                            fprintf(stderr, "Error: No free buffer slots available for new client\n");
+                            close(new_client->fd); 
+                            continue;
+                        }
+                    new_client -> slab_ptr = (char*)iov[assigned_slot].iov_base;
                     if(assigned_slot == -1) {
                         std::cerr << "No free buffer slots available for new client!" << std::endl;
                         close(conn_fd);

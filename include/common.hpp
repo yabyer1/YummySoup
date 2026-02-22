@@ -4,7 +4,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <string_view>
-
+#include "utils.hpp"
 // Visa-grade Assertion Macro
 #define serverAssert(expr) do { \
     if (!(expr)) { \
@@ -14,7 +14,5 @@
     } \
 } while (0)
 
-// Global Glob Matcher declaration so it's visible to CommandExecutor
-bool stringmatchlen(std::string_view pattern, std::string_view str);
-
+ 
 #endif

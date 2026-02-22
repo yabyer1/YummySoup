@@ -24,7 +24,7 @@ public:
         commands["SET"] = [this](auto client, const auto& args, ServerContext& ctx) {
              Storage& db = ctx.db; // Access the storage from the server context
             if (args.size() < 3) {
-                (void)checked_write(client->fd, "-ERR wrong number of arguments for 'set'\r\n", 42);
+                (void)checked_write(client, "-ERR wrong number of arguments for 'set'\r\n", 42);
                 return;
             }
             db.set(std::string(args[1]), std::string(args[2]));
@@ -32,22 +32,22 @@ public:
             // Log to AOF for durability
             ctx.aof.log(args); 
             
-            (void)checked_write(client->fd, "+OK\r\n", 5);
+            (void)checked_write(client, "+OK\r\n", 5);
         };
 
         // --- GET Command ---
         commands["GET"] = [](auto client, const auto& args, ServerContext& ctx) {
             Storage& db = ctx.db; // Access the storage from the server context
             if (args.size() < 2) {
-                (void)checked_write(client->fd, "-ERR wrong number of arguments for 'get'\r\n", 42);
+                (void)checked_write(client, "-ERR wrong number of arguments for 'get'\r\n", 42);
                 return;
             }
             std::string val = db.get(std::string(args[1]));
             if (val == "(nil)") {
-                (void)checked_write(client->fd, "$-1\r\n", 5);
+                (void)checked_write(client, "$-1\r\n", 5);
             } else {
                 std::string resp = "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
-                (void)checked_write(client->fd, resp.c_str(), resp.length());
+                (void)checked_write(client, resp.c_str(), resp.length());
             }
         };
 
@@ -56,17 +56,17 @@ public:
             Storage& db = ctx.db; // Access the storage from the server context
           
             if (args.size() < 2) {
-                (void)checked_write(client->fd, "-ERR wrong number of arguments for 'del'\r\n", 42);
+                (void)checked_write(client, "-ERR wrong number of arguments for 'del'\r\n", 42);
                 return;
             }
             db.del(std::string(args[1]));
             ctx.aof.log(args);
-            (void)checked_write(client->fd, "+OK\r\n", 5);
+            (void)checked_write(client, "+OK\r\n", 5);
         };
         // --- PING Command ---
         commands["PING"] = [](auto client, const auto& args, ServerContext& ctx) {
           
-            (void)checked_write(client->fd, "+PONG\r\n", 7);
+            (void)checked_write(client, "+PONG\r\n", 7);
         };
 
         commands["PUBLISH"] = [this](auto client, const auto& args, ServerContext& ctx) {
@@ -134,11 +134,11 @@ public:
 }
     void sendPubsubMessage(Client* c, std::string_view channel, std::string_view message) {
     std::string resp = ProtocolHandler::format_pubsub("message", channel, message);
-    (void)checked_write(c->fd, resp.c_str(), resp.size());
+    (void)checked_write(c, resp.c_str(),  resp.size());
     }
     void sendPatternMessage(Client* c, std::string_view pattern, std::string_view channel, std::string_view message) {
     std::string resp = ProtocolHandler::format_pubsub("pmessage", channel, message);
-    (void)checked_write(c->fd, resp.c_str(), resp.size());
+    (void)checked_write(c, resp.c_str(), resp.size());
     }
         void publish(const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     serverAssert(tokens.size() >= 3); // PUBLISH <channel> <message>
@@ -173,7 +173,7 @@ void sendSubscriptionConfirmation(Client* c, std::string_view type, std::string_
    std::string count_str = std::to_string(subscription_count);
     std::vector<std::string_view> tokens = { type, channel, count_str };
     std::string resp = ProtocolHandler::to_resp(tokens);
-    (void)checked_write(c->fd, resp.c_str(), resp.size());
+    (void)checked_write(c,  resp.c_str(), resp.size());
 }
 void subscribe(Client* c, const std::vector<std::string_view>& tokens, ServerContext& ctx) {
     std::lock_guard<std::mutex> lock(ctx.pubsub_mutex);
@@ -200,7 +200,7 @@ void subscribe(Client* c, const std::vector<std::string_view>& tokens, ServerCon
         it->second(client, tokens, ctx);
     } else {
         std::string err = "-ERR unknown command '" + cmd_name + "'\r\n";
-        (void)checked_write(client->fd, err.c_str(), err.size());
+        (void)checked_write(client, err.c_str(), err.size());
     }
 }
 };

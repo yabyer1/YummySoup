@@ -1,28 +1,28 @@
 # 1. Compiler and Linker
 CXX = g++
 CXXFLAGS = -std=c++20 -Wall -O3 -I./include -I/home/ubuntu/try/include
-# The Linker Flags: -luring links the io_uring library, -lpthread links thread support
 LDFLAGS = -luring -lpthread
 
-# 2. Files
-TARGET = my_server
-SRCS = src/server.cpp 
+# 2. Files - REMOVED THE COMMA HERE
+SRCS = src/server.cpp src/utils.cpp
 OBJS = $(SRCS:.cpp=.o)
+TARGET = my_server
 
 # 3. Default Rule
 all: $(TARGET)
 
 # 4. Linking the Target
-# This takes your compiled .o files and links them with the libraries
+# Ensure the line below starts with a TAB
 $(TARGET): $(OBJS)
-	$(CXX) $(OBJS) $(LDFLAGS) -o $(TARGET)
+	$(CXX) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
 # 5. Compiling Source Files
+# Ensure the line below starts with a TAB
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # 6. Clean up
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f src/*.o $(TARGET)
 
 .PHONY: all clean
