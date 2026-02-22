@@ -23,6 +23,7 @@
 ServerContext ctx; // Global server context containing shared resources like the slab manager and storage
 struct io_uring ring;  // Global io_uring instance for all workers
 void* shared_buffer_slab;  // Pre-allocated slab for zero-copy reads
+void * shared_buffer_slab_w; //pre allocated slab for writes
 struct iovec iov[1024]; // iovec array for registered buffers (reading)
 struct iovec iovw[1024]; // iovec array for registered buffers (writing)
 int global_epoll_fd;// Global epoll instance for accepting connections and monitoring clients
@@ -70,62 +71,57 @@ void handleDisconnect(std::shared_ptr<Client> c) {
 }
 void flush_worker_thread(ServerContext& ctx) {
     while (true) {
-        // 1. Block until a client has data ready
         std::shared_ptr<Client> client = ctx.ready_clients.pop();
-
         if (!client) continue;
 
-        // 2. Lock the client to safely access its response_buffer
-        std::lock_guard<std::mutex> lock(client->clientMutex);
-        
-        if (client->response_buffer.empty()) {
+        // --- ATOMIC CHECK-AND-SET ---
+        // exchange(true) sets the value to true and returns the OLD value.
+        // If the old value was already true, we skip this client for now.
+        if (client->is_writing.exchange(true, std::memory_order_acquire)) {
+            // Already in flight! Push back to the end of the queue.
+            ctx.ready_clients.push(client);
             continue; 
         }
 
-        // 3. Consolidate vector of strings into the Registered Write Slab
-        // We use the client's specific write_slab_ptr assigned from writeSlabManager
-        size_t total_bytes = 0;
-        char* target_buf = client->write_slab_ptr; 
+        std::lock_guard<std::mutex> lock(client->clientMutex);
+        
+        if (client->response_buffer.empty()) {
+            // Nothing to send? Unlock the state and move on.
+            client->is_writing.store(false, std::memory_order_release);
+            continue; 
+        }
 
+        // 2. Prepare the Slab
+        size_t total_bytes = 0;
         for (const auto& msg : client->response_buffer) {
-            if (total_bytes + msg.size() > BUF_SIZE) {
-                // In a real scenario, you'd handle overflow here
-                break; 
-            }
-            memcpy(target_buf + total_bytes, msg.data(), msg.size());
+            if (total_bytes + msg.size() > 4096) break; // Use your actual BUF_SIZE
+            memcpy(client->write_slab_ptr + total_bytes, msg.data(), msg.size());
             total_bytes += msg.size();
         }
 
-        // 4. Prepare the io_uring SQE for the WRITE_RING
+        // 3. Submit
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx.write_ring);
         if (!sqe) {
-            // Sqe might be null if the ring is full; in production, you'd handle backpressure
+            // Ring full! Unlock and re-queue.
+            client->is_writing.store(false, std::memory_order_release);
+            ctx.ready_clients.push(client);
             continue;
         }
 
-        // Use WRITE_FIXED for maximum performance with registered buffers
-        io_uring_prep_write_fixed(sqe, client->fd, target_buf, total_bytes, 0, client->write_buf_index);
-        
-        // Attach the client pointer so we can clear the buffer in the completion loop
+        io_uring_prep_write_fixed(sqe, client->fd, client->write_slab_ptr, total_bytes, 0, client->write_buf_index);
         io_uring_sqe_set_data(sqe, client.get());
-
-        // 5. Submit to the kernel
-        // Note: Using io_uring_submit is thread-safe if you don't use 
-        // IORING_SETUP_SINGLE_ISSUER, or if only flush threads touch this ring.
         io_uring_submit(&ctx.write_ring);
 
-        // 6. Clear the pending buffer now that it's queued for the kernel
+        // 4. Cleanup CPU-side buffer
         client->response_buffer.clear();
         client->has_pending_write.store(false, std::memory_order_release);
+        
+        // NOTE: is_writing remains TRUE here! 
+        // It will only be set to FALSE in the completion_reaper.
     }
 }
-// --- Worker Logic ---
-void workerThread() {
-    CommandExecutor executor;
-    struct io_uring local_ring;
-    io_uring_queue_init(ENTRIES, &local_ring, 0); // Each worker initializes its own io_uring instance. In a more advanced implementation, we could share the ring across threads with proper synchronization, but for simplicity, we initialize it here. This allows each worker to independently submit and wait for I/O operations without contention on a shared ring. By using separate rings, we can avoid the need for complex locking around the submission and completion queues, improving performance and scalability in our server architecture.
-    io_uring_register_buffers(&local_ring, iov, 1024); //register global slab to be used for all local rings
-    while (true) { //while we need to have a client to process, we wait on the condition variable for a new task to be added to the queue. This allows worker threads to efficiently sleep when there are no tasks and wake up immediately when there are new client file descriptors to process. By using a condition variable, we can avoid busy-waiting and reduce CPU usage while still ensuring that worker threads are responsive to incoming tasks.
+void workerThread(ServerContext& ctx) {
+    while (true) {
         std::shared_ptr<Client> client;
         {
             std::unique_lock<std::mutex> lock(queueMutex);
@@ -133,62 +129,113 @@ void workerThread() {
             int fd = taskQueue.front();
             taskQueue.pop();
             
-            std::lock_guard<std::mutex> mapLock(clientsMapMutex); //lock the clients map to safely access the client object associated with the file descriptor.
+            std::lock_guard<std::mutex> mapLock(clientsMapMutex);
             if (clients.count(fd)) client = clients[fd];
         }
 
         if (!client) continue;
-        bool close_connection = false;
 
-        // 1. Prepare and Submit Fixed Read
-        {
-         
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&local_ring); // Get a submission queue entry for this I/O operation. This allows us to prepare a read operation that will read data directly into the client's assigned buffer slot in the slab. By using io_uring, we can achieve zero-copy reads, improving performance by avoiding unnecessary data copying between kernel and user space. The sqe will be tagged with the client pointer for easy identification when the operation completes, allowing us to efficiently process the incoming data.
-           
-            if (sqe) {
-                // DMA directly into the client's assigned slot in the slab and submit it to local ring for reading 
-               io_uring_prep_read_fixed(sqe, client->fd, client ->slab_ptr + client -> buffer_index, BUF_SIZE - client -> buffer_index, 0, client->ring_index);
-                io_uring_submit_and_wait(&local_ring, 1);
-            }
+        // Atomic check: Are we already reading for this client?
+        if (client->is_reading.exchange(true, std::memory_order_acquire)) {
+            // Already a read SQE in flight, or being processed. Skip.
+            taskQueue.push(client -> fd);
+            continue; 
         }
 
-        // 2. Wait for Completion
-        struct io_uring_cqe *cqe;
-        // In a true high-perf system, we'd use a separate completion thread, 
-        // but for this architecture, we wait for the specific event we submitted.
-        int ret = io_uring_wait_cqe(&local_ring, &cqe);
+        // Prepare the Read SQE
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx.read_ring);
+        if (!sqe) {
+            client->is_reading.store(false, std::memory_order_release);
+            // Re-queue because ring was full
+            std::lock_guard<std::mutex> lock(queueMutex);
+            taskQueue.push(client->fd);
+            continue;
+        }
+
+        // DMA directly into the slab
+        io_uring_prep_read_fixed(sqe, client->fd, 
+                                 client->slab_ptr + client->buffer_index, 
+                                 BUF_SIZE - client->buffer_index, 0, 
+                                 client->ring_index);
         
-        if (ret < 0 || cqe->res <= 0) {
-            close_connection = (ret < 0 || cqe->res == 0);
-            handleDisconnect(client);
-            if (cqe) io_uring_cqe_seen(&local_ring, cqe);
+        // Tag with raw pointer so Reaper knows who finished
+        io_uring_sqe_set_data(sqe, client.get());
+        io_uring_submit(&ctx.read_ring);
+    }
+}
+void read_completion_worker(ServerContext& ctx) {
+    CommandExecutor executor; // Local executor per thread is fine
+    struct io_uring_cqe *cqe;
+
+    while (true) {
+        int ret = io_uring_wait_cqe(&ctx.read_ring, &cqe);
+        if (ret < 0) continue;
+
+        Client* raw_client = static_cast<Client*>(io_uring_cqe_get_data(cqe));
+        if (!raw_client) {
+            io_uring_cqe_seen(&ctx.read_ring, cqe);
+            continue;
+        }
+
+        // Convert to shared_ptr to ensure lifetime during execution
+        std::shared_ptr<Client> client = raw_client->shared_from_this();
+        int bytes_read = cqe->res;
+        io_uring_cqe_seen(&ctx.read_ring, cqe); // Release CQE immediately
+
+        if (bytes_read <= 0) {
+            handleDisconnect(client); // 0 = Close, <0 = Error
         } else {
-   
-            // 3. Zero-Copy Processing: Append from Slab to InputBuffer
-           client-> buffer_index += cqe ->res;
-             while(auto tokens = ProtocolHandler::parse(client -> slab_ptr, client -> buffer_index)) { // we are parsing input buffer line by line \n delimited. we then split into space delimited tokens on the line and execute that line
+            std::lock_guard<std::mutex> lock(client->clientMutex);
+            client->buffer_index += bytes_read;
+
+            // PARSE & EXECUTE inside the Completion Thread
+            while(auto tokens = ProtocolHandler::parse(client->slab_ptr, client->buffer_index)) {
                 executor.execute(client, *tokens, ctx); 
             }
-            io_uring_cqe_seen(&local_ring, cqe);
+            
+            // Logic for moving partial data to start of buffer or resetting index
+            client->resetBuffer(); 
 
-          
+            // IMPORTANT: Allow a new read to be submitted
+            client->is_reading.store(false, std::memory_order_release);
 
-            // 4. Re-arm Epoll one shot for next event on this client
+            // Re-arm Epoll for the next chunk of data
             struct epoll_event ev;
             ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
             ev.data.fd = client->fd;
             epoll_ctl(global_epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
         }
-
-        if (close_connection) {
-            std::cout << "Closing connection for fd: " << client->fd << std::endl;
-            ctx.readSlabManager.release_slot(client->ring_index); // Release the client's buffer slot back to the slab maanger
-            std::lock_guard<std::mutex> mapLock(clientsMapMutex);
-            clients.erase(client->fd);
-        }
     }
 }
+void write_completion_reaper(ServerContext& ctx) {
+    struct io_uring_cqe *cqe;
+    while (true) {
+        // This blocks efficiently (sleeping in the kernel) until ANY write finishes
+        int ret = io_uring_wait_cqe(&ctx.write_ring, &cqe);
+        if (ret < 0) continue;
 
+        // Retrieve the client we attached in the flush thread
+        Client* client = static_cast<Client*>(io_uring_cqe_get_data(cqe));
+        
+        if (client) {
+            // 1. Release the "Slab Lock"
+            client->is_writing.store(false, std::memory_order_release);
+
+            // 2. Check for partial writes or errors
+            if (cqe->res < 0) {
+                // Handle disconnect/error
+            }
+
+            // 3. Re-queue if more data arrived during the write
+            if (client->has_pending_write.load(std::memory_order_acquire)) {
+                ctx.ready_clients.push(client->shared_from_this());
+            }
+        }
+
+        // Tell the ring we've processed this entry
+        io_uring_cqe_seen(&ctx.write_ring, cqe);
+    }
+}
 int main() {
     // 1. Initialize io_uring with Shared Workers
     struct io_uring_params params; // Zero out the params struct before use
@@ -206,7 +253,13 @@ int main() {
         iov[i].iov_len = BUF_SIZE; //this base and len are now registered with io_uring for zero-copy operations. When we prepare a read, we specify the buffer index (ring_index) which corresponds to one of these iovec entries, allowing us to read directly into the slab without intermediate copying.
     }
     io_uring_register_buffers(&ring, iov, 1024); // Register the array of iovec buffers with io_uring. This tells io_uring about our pre-allocated buffers so that we can use them for zero-copy reads. The number of buffers registered is 1024, which matches the size of our iovec array and the slab we allocated. Each buffer can be used by a different client, allowing for efficient concurrent I/O without copying data into user-space buffers.
+   shared_buffer_slab_w = mmap(NULL, 1024 * BUF_SIZE, PROT_READ | PROT_WRITE, 
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    for(int i = 0; i < 1024; i++){
+               iovw[i].iov_base = (char*)shared_buffer_slab_w + (i * BUF_SIZE);
+               iovw[i].iov_len = BUF_SIZE;
 
+    }
     // 
 
     // 3. Socket Setup
@@ -231,22 +284,26 @@ int main() {
     ev.data.fd = listen_fd;
     epoll_ctl(global_epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev); // Add the listening socket to the epoll instance so that we can monitor it for incoming connection events. This allows us to efficiently wait for new connections without blocking, enabling our event-driven architecture. By using epoll, we can scale to a large number of concurrent connections while maintaining high performance. The listening socket will trigger an event when a new client attempts to connect, allowing us to accept the connection and add the new client socket to the epoll instance for further monitoring.
 
-    for (int i = 0; i < THREAD_POOL_SIZE; ++i) {
-        std::thread([&](){
-            struct io_uring local_ring;
-            struct io_uring_params local_params;
-            memset(&local_params, 0, sizeof(local_params));
-            local_params.wq_fd = ring.ring_fd; //use parent ring kernel threads (avoid creating speerate peR thread)
-            local_params.flags = IORING_SETUP_ATTACH_WQ;
-            io_uring_queue_init_params(ENTRIES, &local_ring, &local_params);
-   
-            
-        }).detach();
-    }
-    // Spawn Flush Threads (Outbound IO)
+   std::vector<std::thread> threadPool;
+
+    // 1. Worker Threads: Field FDs from TaskQueue -> Submit to Read Ring
     for (int i = 0; i < 2; ++i) {
-        std::thread(flush_worker_thread, std::ref(ctx)).detach();
+        threadPool.emplace_back(workerThread, std::ref(ctx));
     }
+
+    // 2. Read Completion Group: Wait for Read CQE -> Parse -> Execute
+    // This is where the logic happens, so we give it more threads.
+    for (int i = 0; i < 4; ++i) {
+        threadPool.emplace_back(read_completion_worker, std::ref(ctx));
+    }
+
+    // 3. Flush Threads: Pop from ReadyQueue -> Submit to Write Ring
+    for (int i = 0; i < 2; ++i) {
+        threadPool.emplace_back(flush_worker_thread, std::ref(ctx));
+    }
+
+    // 4. Write Reaper: Wait for Write CQE -> Clear is_writing flag
+    threadPool.emplace_back(write_completion_reaper, std::ref(ctx));
     std::cout << "3FS-Style io_uring Server Online. Port 1234." << std::endl;
 
     while (true) {
@@ -325,6 +382,9 @@ int main() {
                 condition.notify_one();
             }
         }
+    }
+    for (auto& t : threadPool) {
+        if (t.joinable()) t.join();
     }
     return 0;
 }
